@@ -1,10 +1,12 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import {
   View, Text, Image, TouchableOpacity, ScrollView, TextInput,
   ActivityIndicator, StyleSheet, StatusBar, SafeAreaView, Alert
 } from "react-native";
 import * as ImagePicker from "expo-image-picker";
 import * as ImageManipulator from "expo-image-manipulator";
+import * as SQLite from "expo-sqlite";
+import Svg, { Circle } from "react-native-svg";
 
 // ⚠️ 把你的 API Key 填在下面引号里
 const API_KEY = "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";
@@ -28,6 +30,32 @@ const BODY_FIELDS = [
   { key: "calf", label: "小腿围", unit: "cm" },
 ];
 
+function dateKey(d) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+// 打开数据库
+const db = SQLite.openDatabaseSync("health.db");
+
+// 初始化表
+function initDB() {
+  db.execSync(`
+    CREATE TABLE IF NOT EXISTS meals (
+      date TEXT, slot INTEGER, summary TEXT, cal INTEGER, p INTEGER, c INTEGER, f INTEGER, uri TEXT,
+      PRIMARY KEY (date, slot)
+    );
+    CREATE TABLE IF NOT EXISTS exercises (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT, name TEXT, duration INTEGER, cal INTEGER
+    );
+    CREATE TABLE IF NOT EXISTS profile (
+      key TEXT PRIMARY KEY, value TEXT
+    );
+    CREATE TABLE IF NOT EXISTS settings (
+      key TEXT PRIMARY KEY, value TEXT
+    );
+  `);
+}
+
 async function callClaude(messages, maxTokens = 1000) {
   const resp = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
@@ -44,20 +72,67 @@ async function callClaude(messages, maxTokens = 1000) {
 }
 
 export default function App() {
+  const [ready, setReady] = useState(false);
   const [tab, setTab] = useState(0);
   const [currentMeal, setCurrentMeal] = useState(0);
   const [meals, setMeals] = useState([null, null, null]);
-  const [previews, setPreviews] = useState([null, null, null]);
   const [analyzing, setAnalyzing] = useState(false);
   const [exercises, setExercises] = useState([]);
   const [exLoading, setExLoading] = useState({});
   const [profile, setProfile] = useState({});
   const [goalKg, setGoalKg] = useState("");
+  const [allMonthData, setAllMonthData] = useState({}); // 日历用：{ "2026-06-15": netExpenditure }
 
-  const data = meals[currentMeal];
-  const preview = previews[currentMeal];
   const today = new Date();
-  const dateStr = `${today.getFullYear()} 年 ${today.getMonth() + 1} 月 ${today.getDate()} 日 · 周${WEEKDAYS[today.getDay()]}`;
+  const todayStr = dateKey(today);
+  const dateDisplay = `${today.getFullYear()} 年 ${today.getMonth() + 1} 月 ${today.getDate()} 日 · 周${WEEKDAYS[today.getDay()]}`;
+
+  // ── 启动：初始化数据库 + 读取今天的数据 ──
+  useEffect(() => {
+    initDB();
+    loadToday();
+    loadProfile();
+    loadGoal();
+    setReady(true);
+  }, []);
+
+  function loadToday() {
+    // 读餐食
+    const mealRows = db.getAllSync("SELECT * FROM meals WHERE date = ?", [todayStr]);
+    const m = [null, null, null];
+    mealRows.forEach(r => { m[r.slot] = { summary: r.summary, cal: r.cal, p: r.p, c: r.c, f: r.f, uri: r.uri }; });
+    setMeals(m);
+    // 读运动
+    const exRows = db.getAllSync("SELECT * FROM exercises WHERE date = ?", [todayStr]);
+    setExercises(exRows.map(r => ({ id: r.id, name: r.name, duration: String(r.duration), cal: r.cal })));
+  }
+
+  function loadProfile() {
+    const rows = db.getAllSync("SELECT * FROM profile");
+    const p = {};
+    rows.forEach(r => { p[r.key] = r.value; });
+    setProfile(p);
+  }
+
+  function loadGoal() {
+    const rows = db.getAllSync("SELECT value FROM settings WHERE key = 'goalKg'");
+    if (rows.length) setGoalKg(rows[0].value);
+  }
+
+  // 计算某月每天净支出（日历用）
+  function loadMonthData(year, month) {
+    const bmr = parseInt(profile.bmr) || 0;
+    const prefix = `${year}-${String(month + 1).padStart(2, "0")}`;
+    const mealRows = db.getAllSync("SELECT date, SUM(cal) as total FROM meals WHERE date LIKE ? GROUP BY date", [prefix + "%"]);
+    const exRows = db.getAllSync("SELECT date, SUM(cal) as total FROM exercises WHERE date LIKE ? GROUP BY date", [prefix + "%"]);
+    const intake = {}; mealRows.forEach(r => { intake[r.date] = r.total; });
+    const exer = {}; exRows.forEach(r => { exer[r.date] = r.total; });
+    const out = {};
+    Object.keys(intake).forEach(d => {
+      if (bmr && intake[d]) out[d] = intake[d] - bmr - (exer[d] || 0);
+    });
+    setAllMonthData(out);
+  }
 
   // ── 拍照分析 ──
   async function pickImage() {
@@ -67,22 +142,25 @@ export default function App() {
     const result = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ImagePicker.MediaTypeOptions.Images, quality: 1 });
     if (result.canceled) return;
     const asset = result.assets[0];
-    const newPreviews = [...previews];
-    newPreviews[currentMeal] = asset.uri;
-    setPreviews(newPreviews);
     setAnalyzing(true);
     try {
-      const m = await ImageManipulator.manipulateAsync(asset.uri, [{ resize: { width: 1024 } }],
+      const mp = await ImageManipulator.manipulateAsync(asset.uri, [{ resize: { width: 1024 } }],
         { compress: 0.7, format: ImageManipulator.SaveFormat.JPEG, base64: true });
       const text = await callClaude([{
         role: "user", content: [
-          { type: "image", source: { type: "base64", media_type: "image/jpeg", data: m.base64 } },
+          { type: "image", source: { type: "base64", media_type: "image/jpeg", data: mp.base64 } },
           { type: "text", text: '请分析这张餐食图片，用中文输出 JSON，不要加任何说明文字，格式：{"summary":"食物描述30字以内","cal":数字,"p":数字,"c":数字,"f":数字}，cal是总千卡，p=蛋白质克，c=碳水克，f=脂肪克。' }
         ]
       }]);
       const parsed = JSON.parse(text.replace(/```json|```/g, "").trim());
+      const meal = { ...parsed, uri: asset.uri };
+      // 存数据库
+      db.runSync(
+        "INSERT OR REPLACE INTO meals (date, slot, summary, cal, p, c, f, uri) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        [todayStr, currentMeal, meal.summary, meal.cal, meal.p, meal.c, meal.f, meal.uri]
+      );
       const newMeals = [...meals];
-      newMeals[currentMeal] = parsed;
+      newMeals[currentMeal] = meal;
       setMeals(newMeals);
     } catch (e) {
       Alert.alert("分析失败", String(e.message || e));
@@ -90,14 +168,25 @@ export default function App() {
     setAnalyzing(false);
   }
 
+  function deleteMeal() {
+    db.runSync("DELETE FROM meals WHERE date = ? AND slot = ?", [todayStr, currentMeal]);
+    const newMeals = [...meals];
+    newMeals[currentMeal] = null;
+    setMeals(newMeals);
+  }
+
   // ── 运动 ──
   function addExercise() {
-    setExercises(prev => [...prev, { id: Date.now(), name: "", duration: "", cal: null }]);
+    const res = db.runSync("INSERT INTO exercises (date, name, duration, cal) VALUES (?, '', 0, NULL)", [todayStr]);
+    setExercises(prev => [...prev, { id: res.lastInsertRowId, name: "", duration: "", cal: null }]);
   }
   function updateExercise(id, field, value) {
     setExercises(prev => prev.map(e => e.id === id ? { ...e, [field]: value } : e));
+    if (field === "name") db.runSync("UPDATE exercises SET name = ? WHERE id = ?", [value, id]);
+    if (field === "duration") db.runSync("UPDATE exercises SET duration = ? WHERE id = ?", [parseInt(value) || 0, id]);
   }
   function removeExercise(id) {
+    db.runSync("DELETE FROM exercises WHERE id = ?", [id]);
     setExercises(prev => prev.filter(e => e.id !== id));
   }
   async function calcExercise(id, name, duration) {
@@ -112,15 +201,31 @@ export default function App() {
         content: `一个体重${w}kg的人做"${name}"运动${duration}分钟，大约消耗多少卡路里？只输出一个整数，不要任何其他文字。`
       }], 100);
       const num = parseInt(text.replace(/[^\d]/g, ""));
-      updateExercise(id, "cal", !isNaN(num) && num > 0 ? num : Math.round(parseInt(duration) * 5.5));
+      const cal = !isNaN(num) && num > 0 ? num : Math.round(parseInt(duration) * 5.5);
+      db.runSync("UPDATE exercises SET cal = ? WHERE id = ?", [cal, id]);
+      setExercises(prev => prev.map(e => e.id === id ? { ...e, cal } : e));
     } catch {
-      updateExercise(id, "cal", Math.round(parseInt(duration) * 5.5));
+      const cal = Math.round(parseInt(duration) * 5.5);
+      db.runSync("UPDATE exercises SET cal = ? WHERE id = ?", [cal, id]);
+      setExercises(prev => prev.map(e => e.id === id ? { ...e, cal } : e));
     }
     setExLoading(prev => ({ ...prev, [id]: false }));
   }
   function exerciseBlur(id, name, duration) {
     const ex = exercises.find(e => e.id === id);
     if (ex && name.trim() && duration && !ex.cal && !exLoading[id]) calcExercise(id, name, duration);
+  }
+
+  // ── 个人资料 ──
+  function saveProfile(key, value) {
+    setProfile(p => ({ ...p, [key]: value }));
+    db.runSync("INSERT OR REPLACE INTO profile (key, value) VALUES (?, ?)", [key, value]);
+  }
+
+  // ── 目标 ──
+  function saveGoal(value) {
+    setGoalKg(value);
+    db.runSync("INSERT OR REPLACE INTO settings (key, value) VALUES ('goalKg', ?)", [value]);
   }
 
   // ── 计算 ──
@@ -130,6 +235,7 @@ export default function App() {
   const net = (bmr && (totalCal || exCal)) ? totalCal - bmr - exCal : null;
   const goalCal = goalKg ? Math.round(parseFloat(goalKg) * 7700) : 0;
 
+  const data = meals[currentMeal];
   let macros = null;
   if (data) {
     const t = data.p * 4 + data.c * 4 + data.f * 9 || 1;
@@ -146,6 +252,16 @@ export default function App() {
     { icon: "👤", label: "我的" },
   ];
 
+  // 切到日历页时，计算当月数据
+  function goToCalendar() {
+    loadMonthData(today.getFullYear(), today.getMonth());
+    setTab(2);
+  }
+
+  if (!ready) {
+    return <SafeAreaView style={styles.safe}><View style={{flex:1,justifyContent:"center",alignItems:"center"}}><ActivityIndicator color="#6ee7b7" /></View></SafeAreaView>;
+  }
+
   return (
     <SafeAreaView style={styles.safe}>
       <StatusBar barStyle="light-content" />
@@ -154,7 +270,7 @@ export default function App() {
         {/* ════════ 记录 ════════ */}
         {tab === 0 && (<>
           <Text style={styles.title}>今日记录</Text>
-          <Text style={styles.date}>{dateStr}</Text>
+          <Text style={styles.date}>{dateDisplay}</Text>
           <View style={styles.tabs}>
             {MEAL_LABELS.map((m, i) => (
               <TouchableOpacity key={i} onPress={() => setCurrentMeal(i)} style={[styles.tab, currentMeal === i && styles.tabActive]}>
@@ -164,7 +280,7 @@ export default function App() {
             ))}
           </View>
           <TouchableOpacity style={styles.upload} onPress={pickImage} activeOpacity={0.8}>
-            {preview ? <Image source={{ uri: preview }} style={styles.previewImg} /> : (
+            {data?.uri ? <Image source={{ uri: data.uri }} style={styles.previewImg} /> : (
               <View style={styles.uploadInner}>
                 <Text style={{ fontSize: 28 }}>📷</Text>
                 <Text style={styles.uploadText}>点击上传餐食照片</Text>
@@ -191,6 +307,9 @@ export default function App() {
                 <Macro val={data.c} label="碳水" color="#f59e0b" pct={macros.cp} />
                 <Macro val={data.f} label="脂肪" color="#f87171" pct={macros.fp} />
               </View>
+              <TouchableOpacity style={styles.deleteBtn} onPress={deleteMeal}>
+                <Text style={styles.deleteBtnText}>🗑 删除这条记录</Text>
+              </TouchableOpacity>
             </View>
           )}
           <View style={styles.daily}>
@@ -241,8 +360,7 @@ export default function App() {
                     onBlur={() => isReal && exerciseBlur(ex.id, ex.name, ex.duration)}
                     placeholder="运动名称" placeholderTextColor="#444"
                     style={styles.exNameInput}
-                    editable={isReal || ex.id === "e0"}
-                    onFocus={() => { if (!isReal && ex.id === "e0") addExercise(); }}
+                    onFocus={() => { if (!isReal) addExercise(); }}
                   />
                   <View style={styles.exDurWrap}>
                     <TextInput
@@ -276,49 +394,20 @@ export default function App() {
         </>)}
 
         {/* ════════ 日历 ════════ */}
-        {tab === 2 && (<>
-          <Text style={styles.title}>本月目标</Text>
-          <Text style={styles.date}>{today.getFullYear()} 年 {today.getMonth() + 1} 月</Text>
-          <View style={styles.goalCard}>
-            <Text style={styles.goalLabel}>本月想瘦</Text>
-            <View style={styles.goalInputRow}>
-              <TextInput value={goalKg} onChangeText={setGoalKg} placeholder="0.0" placeholderTextColor="#444" keyboardType="decimal-pad" style={styles.goalInput} />
-              <Text style={styles.goalUnit}>kg</Text>
-            </View>
-            <View style={styles.goalCalc}>
-              <Text style={styles.goalCalcText}>{goalKg || "0"} kg × 7700 =</Text>
-              <Text style={styles.goalCalcResult}>{goalCal ? goalCal.toLocaleString() : "0"} kcal</Text>
-            </View>
-            {goalCal > 0 && (() => {
-              const achieved = net !== null ? -net : 0;
-              const pct = Math.max(0, Math.min(100, Math.round(achieved / goalCal * 100)));
-              const remaining = goalCal - achieved;
-              return (
-                <View style={styles.progWrap}>
-                  <View style={styles.progBarBg}>
-                    <View style={[styles.progBarFill, { width: pct + "%" }]} />
-                  </View>
-                  <View style={styles.progStats}>
-                    <Text style={styles.progPct}>{pct}% 完成</Text>
-                    <Text style={styles.progRemain}>{remaining <= 0 ? "已达成 🎉" : `还差 ${remaining.toLocaleString()} kcal`}</Text>
-                  </View>
-                  <Text style={styles.progHint}>* 目前按今日净支出估算，明天接数据库后会按全月累计</Text>
-                </View>
-              );
-            })()}
-          </View>
-        </>)}
+        {tab === 2 && (
+          <CalendarPage allMonthData={allMonthData} bmr={bmr} goalKg={goalKg} saveGoal={saveGoal} goalCal={goalCal} net={net} />
+        )}
 
         {/* ════════ 我的 ════════ */}
         {tab === 3 && (<>
           <Text style={styles.title}>个人资料</Text>
-          <Text style={styles.date}>填写身体指标</Text>
+          <Text style={styles.date}>填写身体指标（自动保存）</Text>
           {BODY_FIELDS.map(({ key, label, unit }) => (
             <View key={key} style={styles.profileRow}>
               <Text style={styles.profileLabel}>{label}</Text>
               <TextInput
                 value={profile[key] || ""}
-                onChangeText={t => setProfile(p => ({ ...p, [key]: t }))}
+                onChangeText={t => saveProfile(key, t)}
                 placeholder="—" placeholderTextColor="#444" keyboardType="decimal-pad"
                 style={styles.profileInput}
               />
@@ -329,16 +418,103 @@ export default function App() {
 
       </ScrollView>
 
-      {/* ════════ 底部导航 ════════ */}
       <View style={styles.nav}>
         {NAV.map((n, i) => (
-          <TouchableOpacity key={i} style={styles.navItem} onPress={() => setTab(i)}>
+          <TouchableOpacity key={i} style={styles.navItem} onPress={() => i === 2 ? goToCalendar() : setTab(i)}>
             <Text style={styles.navIcon}>{n.icon}</Text>
             <Text style={[styles.navLabel, { color: tab === i ? "#6ee7b7" : "#3a3a4a" }]}>{n.label}</Text>
           </TouchableOpacity>
         ))}
       </View>
     </SafeAreaView>
+  );
+}
+
+function Ring({ pct, size = 120, stroke = 10, color = "#818cf8" }) {
+  const r = (size - stroke) / 2;
+  const circ = 2 * Math.PI * r;
+  const filled = Math.min(Math.max(pct, 0), 100) / 100 * circ;
+  return (
+    <View style={{ width: size, height: size, alignItems: "center", justifyContent: "center" }}>
+      <Svg width={size} height={size} style={{ position: "absolute", transform: [{ rotate: "-90deg" }] }}>
+        <Circle cx={size / 2} cy={size / 2} r={r} stroke="#252530" strokeWidth={stroke} fill="none" />
+        <Circle cx={size / 2} cy={size / 2} r={r} stroke={color} strokeWidth={stroke} fill="none"
+          strokeLinecap="round" strokeDasharray={`${filled} ${circ}`} />
+      </Svg>
+      <Text style={{ color: "#fff", fontSize: 26, fontWeight: "700" }}>{pct}%</Text>
+      <Text style={{ color: "#555", fontSize: 11, marginTop: 2 }}>已完成</Text>
+    </View>
+  );
+}
+
+function CalendarPage({ allMonthData, bmr, goalKg, saveGoal, goalCal, net }) {
+  const today = new Date();
+  const year = today.getFullYear();
+  const month = today.getMonth();
+  const firstDay = new Date(year, month, 1).getDay();
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+  const cells = [];
+  for (let i = 0; i < firstDay; i++) cells.push(null);
+  for (let d = 1; d <= daysInMonth; d++) cells.push(d);
+
+  let monthAchieved = 0;
+  Object.values(allMonthData).forEach(v => { monthAchieved += -v; });
+  const pct = goalCal > 0 ? Math.max(0, Math.min(100, Math.round(monthAchieved / goalCal * 100))) : 0;
+  const remaining = goalCal - monthAchieved;
+
+  return (
+    <>
+      <Text style={styles.title}>{year} 年 {month + 1} 月</Text>
+      <Text style={styles.date}>每格 = 摄入 − 基础代谢 − 运动</Text>
+
+      <View style={styles.calWeek}>
+        {WEEKDAYS.map(w => <Text key={w} style={styles.calWeekText}>{w}</Text>)}
+      </View>
+      <View style={styles.calGrid}>
+        {cells.map((d, i) => {
+          if (!d) return <View key={i} style={styles.calCell} />;
+          const key = `${year}-${String(month + 1).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+          const val = allMonthData[key];
+          const isToday = d === today.getDate();
+          const color = val == null ? "#555" : val <= 0 ? "#6ee7b7" : "#f87171";
+          return (
+            <View key={i} style={[styles.calCell, isToday && styles.calCellToday]}>
+              <Text style={[styles.calDay, { color: isToday ? "#6ee7b7" : "#bbb" }]}>{d}</Text>
+              {val != null && <Text style={[styles.calVal, { color }]}>{val <= 0 ? "" : "+"}{val}</Text>}
+            </View>
+          );
+        })}
+      </View>
+
+      <View style={styles.goalCard}>
+        <Text style={styles.goalLabel}>本月想瘦</Text>
+        <View style={styles.goalInputRow}>
+          <TextInput value={goalKg} onChangeText={saveGoal} placeholder="0.0" placeholderTextColor="#444" keyboardType="decimal-pad" style={styles.goalInput} />
+          <Text style={styles.goalUnit}>kg</Text>
+        </View>
+        <View style={styles.goalCalc}>
+          <Text style={styles.goalCalcText}>{goalKg || "0"} kg × 7700 =</Text>
+          <Text style={styles.goalCalcResult}>{goalCal ? goalCal.toLocaleString() : "0"} kcal</Text>
+        </View>
+        {goalCal > 0 && (
+          <View style={styles.progSection}>
+            <Ring pct={pct} color={pct >= 100 ? "#6ee7b7" : "#818cf8"} />
+            <View style={styles.progStatsCol}>
+              <View style={styles.progStatBox}>
+                <Text style={styles.progStatLabel}>本月已支出</Text>
+                <Text style={styles.progStatValGreen}>{Math.round(monthAchieved).toLocaleString()} kcal</Text>
+              </View>
+              <View style={styles.progStatBox}>
+                <Text style={styles.progStatLabel}>距目标还差</Text>
+                <Text style={[styles.progStatValAmber, remaining <= 0 && { color: "#6ee7b7" }]}>
+                  {remaining <= 0 ? "已达成 🎉" : Math.round(remaining).toLocaleString() + " kcal"}
+                </Text>
+              </View>
+            </View>
+          </View>
+        )}
+      </View>
+    </>
   );
 }
 
@@ -363,7 +539,7 @@ const styles = StyleSheet.create({
   tabEmoji: { fontSize: 15, marginBottom: 2 },
   tabLabel: { fontSize: 12, color: "#666", fontWeight: "500" },
   tabLabelActive: { color: "#fff" },
-  upload: { backgroundColor: "#1e1e28", borderRadius: 16, height: 180, borderWidth: 1.5, borderColor: "#333", borderStyle: "dashed", overflow: "hidden", justifyContent: "center", alignItems: "center" },
+  upload: { backgroundColor: "#1e1e28", borderRadius: 16, height: 240, borderWidth: 1.5, borderColor: "#333", borderStyle: "dashed", overflow: "hidden", justifyContent: "center", alignItems: "center" },
   uploadInner: { alignItems: "center", gap: 8 },
   uploadText: { color: "#555", fontSize: 13 },
   uploadHint: { color: "#3a3a4a", fontSize: 11 },
@@ -372,6 +548,8 @@ const styles = StyleSheet.create({
   analyzingText: { color: "#6ee7b7", fontSize: 13 },
   card: { marginTop: 12, backgroundColor: "#1e1e28", borderRadius: 16, padding: 16 },
   cardLabel: { color: "#555", fontSize: 10, letterSpacing: 1, marginBottom: 4 },
+  deleteBtn: { marginTop: 14, paddingVertical: 10, borderRadius: 10, backgroundColor: "#2a1f24", alignItems: "center" },
+  deleteBtnText: { color: "#f87171", fontSize: 12, fontWeight: "600" },
   summary: { color: "#e0e0e0", fontSize: 13, lineHeight: 20, marginBottom: 14 },
   calRow: { flexDirection: "row", alignItems: "baseline", gap: 5, marginBottom: 14, paddingBottom: 14, borderBottomWidth: 1, borderBottomColor: "#2a2a3a" },
   calNum: { color: "#6ee7b7", fontSize: 30, fontWeight: "700" },
@@ -394,7 +572,6 @@ const styles = StyleSheet.create({
   netRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginTop: 8, paddingTop: 8, borderTopWidth: 1, borderTopColor: "#222" },
   netLabel: { color: "#555", fontSize: 11 },
   netVal: { fontSize: 13, fontWeight: "700" },
-  // exercise
   exCard: { backgroundColor: "#1e1e28", borderRadius: 12, padding: 12, marginBottom: 8 },
   exRow: { flexDirection: "row", alignItems: "center", gap: 8 },
   exIdx: { width: 18, height: 18, borderRadius: 5, backgroundColor: "#252530", alignItems: "center", justifyContent: "center" },
@@ -412,8 +589,14 @@ const styles = StyleSheet.create({
   exTotal: { marginTop: 12, backgroundColor: "#1a1a24", borderRadius: 12, padding: 14, flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
   exTotalLabel: { color: "#888", fontSize: 12 },
   exTotalVal: { color: "#818cf8", fontSize: 16, fontWeight: "700" },
-  // goal
-  goalCard: { backgroundColor: "#1a1a24", borderRadius: 14, padding: 16 },
+  calWeek: { flexDirection: "row", marginBottom: 6 },
+  calWeekText: { flex: 1, textAlign: "center", color: "#555", fontSize: 12 },
+  calGrid: { flexDirection: "row", flexWrap: "wrap", marginBottom: 4 },
+  calCell: { width: `${100/7}%`, aspectRatio: 1, alignItems: "center", justifyContent: "center" },
+  calCellToday: { backgroundColor: "#1e1e28", borderRadius: 10 },
+  calDay: { fontSize: 16, textAlign: "center", fontWeight: "500" },
+  calVal: { fontSize: 10, textAlign: "center", marginTop: 2 },
+  goalCard: { backgroundColor: "#1a1a24", borderRadius: 14, padding: 16, marginTop: 12 },
   goalLabel: { color: "#888", fontSize: 12, marginBottom: 10 },
   goalInputRow: { flexDirection: "row", alignItems: "baseline", gap: 6, marginBottom: 14 },
   goalInput: { color: "#6ee7b7", fontSize: 32, fontWeight: "700", minWidth: 80, borderBottomWidth: 1, borderBottomColor: "#333", padding: 0 },
@@ -421,19 +604,16 @@ const styles = StyleSheet.create({
   goalCalc: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", backgroundColor: "#252530", borderRadius: 10, padding: 12 },
   goalCalcText: { color: "#888", fontSize: 12 },
   goalCalcResult: { color: "#f59e0b", fontSize: 15, fontWeight: "700" },
-  progWrap: { marginTop: 16 },
-  progBarBg: { height: 10, backgroundColor: "#252530", borderRadius: 5, overflow: "hidden" },
-  progBarFill: { height: "100%", backgroundColor: "#818cf8", borderRadius: 5 },
-  progStats: { flexDirection: "row", justifyContent: "space-between", marginTop: 8 },
-  progPct: { color: "#818cf8", fontSize: 12, fontWeight: "600" },
-  progRemain: { color: "#f59e0b", fontSize: 12 },
-  progHint: { color: "#3a3a4a", fontSize: 10, marginTop: 8 },
-  // profile
+  progSection: { marginTop: 18, flexDirection: "row", alignItems: "center", gap: 18 },
+  progStatsCol: { flex: 1, gap: 10 },
+  progStatBox: { backgroundColor: "#252530", borderRadius: 10, padding: 12 },
+  progStatLabel: { color: "#666", fontSize: 11, marginBottom: 3 },
+  progStatValGreen: { color: "#6ee7b7", fontSize: 16, fontWeight: "700" },
+  progStatValAmber: { color: "#f59e0b", fontSize: 16, fontWeight: "700" },
   profileRow: { flexDirection: "row", alignItems: "center", backgroundColor: "#1e1e28", borderRadius: 10, paddingHorizontal: 12, paddingVertical: 10, marginBottom: 6 },
   profileLabel: { color: "#aaa", fontSize: 13, flex: 1 },
   profileInput: { color: "#6ee7b7", fontSize: 14, fontWeight: "600", textAlign: "right", minWidth: 60 },
   profileUnit: { color: "#555", fontSize: 11, marginLeft: 6, width: 30 },
-  // nav
   nav: { flexDirection: "row", backgroundColor: "#1a1a22", borderTopWidth: 1, borderTopColor: "#1e1e26", paddingTop: 8, paddingBottom: 8 },
   navItem: { flex: 1, alignItems: "center" },
   navIcon: { fontSize: 20, marginBottom: 2 },
