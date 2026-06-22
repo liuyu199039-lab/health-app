@@ -5,8 +5,11 @@ import {
 } from "react-native";
 import * as ImagePicker from "expo-image-picker";
 import * as ImageManipulator from "expo-image-manipulator";
+import * as FileSystem from "expo-file-system";
 import * as SQLite from "expo-sqlite";
 import Svg, { Circle } from "react-native-svg";
+import { LineChart } from "react-native-chart-kit";
+import { Dimensions } from "react-native";
 
 // ⚠️ 把你的 API Key 填在下面引号里
 const API_KEY = "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";
@@ -53,6 +56,11 @@ function initDB() {
     CREATE TABLE IF NOT EXISTS settings (
       key TEXT PRIMARY KEY, value TEXT
     );
+    CREATE TABLE IF NOT EXISTS body_history (
+      date TEXT PRIMARY KEY,
+      height REAL, weight REAL, bmr REAL, chest REAL, waist REAL,
+      lowerAbdomen REAL, hip REAL, arm REAL, thigh REAL, calf REAL
+    );
   `);
 }
 
@@ -82,28 +90,40 @@ export default function App() {
   const [profile, setProfile] = useState({});
   const [goalKg, setGoalKg] = useState("");
   const [allMonthData, setAllMonthData] = useState({}); // 日历用：{ "2026-06-15": netExpenditure }
+  const [selDateStr, setSelDateStr] = useState(dateKey(new Date())); // 当前查看的日期
+  const [bodyHistory, setBodyHistory] = useState([]);
+  const [chartMetric, setChartMetric] = useState("weight");
 
   const today = new Date();
   const todayStr = dateKey(today);
-  const dateDisplay = `${today.getFullYear()} 年 ${today.getMonth() + 1} 月 ${today.getDate()} 日 · 周${WEEKDAYS[today.getDay()]}`;
+  const selParts = selDateStr.split("-").map(Number);
+  const selDateObj = new Date(selParts[0], selParts[1] - 1, selParts[2]);
+  const isToday = selDateStr === todayStr;
+  const dateDisplay = `${selParts[0]} 年 ${selParts[1]} 月 ${selParts[2]} 日 · 周${WEEKDAYS[selDateObj.getDay()]}`;
 
-  // ── 启动：初始化数据库 + 读取今天的数据 ──
+  // ── 启动：初始化数据库 ──
   useEffect(() => {
     initDB();
-    loadToday();
     loadProfile();
     loadGoal();
+    loadBodyHistory();
     setReady(true);
   }, []);
 
-  function loadToday() {
+  // 每当选中日期变化，重新读取那天的饮食和运动
+  useEffect(() => {
+    if (!ready) return;
+    loadDay(selDateStr);
+  }, [selDateStr, ready]);
+
+  function loadDay(dStr) {
     // 读餐食
-    const mealRows = db.getAllSync("SELECT * FROM meals WHERE date = ?", [todayStr]);
+    const mealRows = db.getAllSync("SELECT * FROM meals WHERE date = ?", [dStr]);
     const m = [null, null, null];
     mealRows.forEach(r => { m[r.slot] = { summary: r.summary, cal: r.cal, p: r.p, c: r.c, f: r.f, uri: r.uri }; });
     setMeals(m);
     // 读运动
-    const exRows = db.getAllSync("SELECT * FROM exercises WHERE date = ?", [todayStr]);
+    const exRows = db.getAllSync("SELECT * FROM exercises WHERE date = ?", [dStr]);
     setExercises(exRows.map(r => ({ id: r.id, name: r.name, duration: String(r.duration), cal: r.cal })));
   }
 
@@ -112,6 +132,24 @@ export default function App() {
     const p = {};
     rows.forEach(r => { p[r.key] = r.value; });
     setProfile(p);
+  }
+
+  function loadBodyHistory() {
+    const rows = db.getAllSync("SELECT * FROM body_history ORDER BY date ASC");
+    setBodyHistory(rows);
+  }
+
+  function saveBodyToday() {
+    const f = k => { const v = parseFloat(profile[k]); return isNaN(v) ? null : v; };
+    db.runSync(
+      `INSERT OR REPLACE INTO body_history
+        (date, height, weight, bmr, chest, waist, lowerAbdomen, hip, arm, thigh, calf)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [todayStr, f("height"), f("weight"), f("bmr"), f("chest"), f("waist"),
+       f("lowerAbdomen"), f("hip"), f("arm"), f("thigh"), f("calf")]
+    );
+    loadBodyHistory();
+    Alert.alert("已记录", `${todayStr} 的身体数据已保存`);
   }
 
   function loadGoal() {
@@ -153,11 +191,21 @@ export default function App() {
         ]
       }]);
       const parsed = JSON.parse(text.replace(/```json|```/g, "").trim());
-      const meal = { ...parsed, uri: asset.uri };
+      // 把图片复制到 App 永久目录，避免临时缓存被系统清理
+      let permUri = mp.uri;
+      try {
+        const dir = FileSystem.documentDirectory + "meals/";
+        await FileSystem.makeDirectoryAsync(dir, { intermediates: true }).catch(() => {});
+        permUri = dir + `${selDateStr}_${currentMeal}.jpg`;
+        await FileSystem.copyAsync({ from: mp.uri, to: permUri });
+      } catch (copyErr) {
+        permUri = mp.uri; // 复制失败就退回临时路径
+      }
+      const meal = { ...parsed, uri: permUri };
       // 存数据库
       db.runSync(
         "INSERT OR REPLACE INTO meals (date, slot, summary, cal, p, c, f, uri) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        [todayStr, currentMeal, meal.summary, meal.cal, meal.p, meal.c, meal.f, meal.uri]
+        [selDateStr, currentMeal, meal.summary, meal.cal, meal.p, meal.c, meal.f, meal.uri]
       );
       const newMeals = [...meals];
       newMeals[currentMeal] = meal;
@@ -169,7 +217,7 @@ export default function App() {
   }
 
   function deleteMeal() {
-    db.runSync("DELETE FROM meals WHERE date = ? AND slot = ?", [todayStr, currentMeal]);
+    db.runSync("DELETE FROM meals WHERE date = ? AND slot = ?", [selDateStr, currentMeal]);
     const newMeals = [...meals];
     newMeals[currentMeal] = null;
     setMeals(newMeals);
@@ -177,7 +225,7 @@ export default function App() {
 
   // ── 运动 ──
   function addExercise() {
-    const res = db.runSync("INSERT INTO exercises (date, name, duration, cal) VALUES (?, '', 0, NULL)", [todayStr]);
+    const res = db.runSync("INSERT INTO exercises (date, name, duration, cal) VALUES (?, '', 0, NULL)", [selDateStr]);
     setExercises(prev => [...prev, { id: res.lastInsertRowId, name: "", duration: "", cal: null }]);
   }
   function updateExercise(id, field, value) {
@@ -269,8 +317,25 @@ export default function App() {
 
         {/* ════════ 记录 ════════ */}
         {tab === 0 && (<>
-          <Text style={styles.title}>今日记录</Text>
-          <Text style={styles.date}>{dateDisplay}</Text>
+          <View style={styles.recHeader}>
+            <Text style={styles.title}>{isToday ? "今日记录" : "历史记录"}</Text>
+            {!isToday && (
+              <TouchableOpacity onPress={() => setSelDateStr(todayStr)} style={styles.todayBtn}>
+                <Text style={styles.todayBtnText}>回到今天</Text>
+              </TouchableOpacity>
+            )}
+          </View>
+          <View style={styles.dateNav}>
+            <TouchableOpacity onPress={() => {
+              const d = new Date(selDateObj); d.setDate(d.getDate() - 1); setSelDateStr(dateKey(d));
+            }}><Text style={styles.dateNavArrow}>‹</Text></TouchableOpacity>
+            <Text style={[styles.date, { marginBottom: 0, marginTop: 0 }]}>{dateDisplay}</Text>
+            <TouchableOpacity onPress={() => {
+              const d = new Date(selDateObj); d.setDate(d.getDate() + 1);
+              const nd = dateKey(d);
+              if (nd <= todayStr) setSelDateStr(nd);
+            }}><Text style={[styles.dateNavArrow, { color: selDateStr >= todayStr ? "#2a2a3a" : "#6ee7b7" }]}>›</Text></TouchableOpacity>
+          </View>
           <View style={styles.tabs}>
             {MEAL_LABELS.map((m, i) => (
               <TouchableOpacity key={i} onPress={() => setCurrentMeal(i)} style={[styles.tab, currentMeal === i && styles.tabActive]}>
@@ -395,13 +460,15 @@ export default function App() {
 
         {/* ════════ 日历 ════════ */}
         {tab === 2 && (
-          <CalendarPage allMonthData={allMonthData} bmr={bmr} goalKg={goalKg} saveGoal={saveGoal} goalCal={goalCal} net={net} />
+          <CalendarPage allMonthData={allMonthData} bmr={bmr} goalKg={goalKg} saveGoal={saveGoal} goalCal={goalCal} net={net}
+            todayStr={todayStr}
+            onPickDay={(dStr) => { setSelDateStr(dStr); setTab(0); }} />
         )}
 
         {/* ════════ 我的 ════════ */}
         {tab === 3 && (<>
           <Text style={styles.title}>个人资料</Text>
-          <Text style={styles.date}>填写身体指标（自动保存）</Text>
+          <Text style={styles.date}>填写身体指标（自动保存当前值）</Text>
           {BODY_FIELDS.map(({ key, label, unit }) => (
             <View key={key} style={styles.profileRow}>
               <Text style={styles.profileLabel}>{label}</Text>
@@ -414,6 +481,12 @@ export default function App() {
               <Text style={styles.profileUnit}>{unit}</Text>
             </View>
           ))}
+
+          <TouchableOpacity style={styles.recordBodyBtn} onPress={saveBodyToday}>
+            <Text style={styles.recordBodyBtnText}>📌 记录今日数据</Text>
+          </TouchableOpacity>
+
+          <BodyTrend bodyHistory={bodyHistory} metric={chartMetric} setMetric={setChartMetric} />
         </>)}
 
       </ScrollView>
@@ -447,7 +520,7 @@ function Ring({ pct, size = 120, stroke = 10, color = "#818cf8" }) {
   );
 }
 
-function CalendarPage({ allMonthData, bmr, goalKg, saveGoal, goalCal, net }) {
+function CalendarPage({ allMonthData, bmr, goalKg, saveGoal, goalCal, net, onPickDay, todayStr }) {
   const today = new Date();
   const year = today.getFullYear();
   const month = today.getMonth();
@@ -465,7 +538,7 @@ function CalendarPage({ allMonthData, bmr, goalKg, saveGoal, goalCal, net }) {
   return (
     <>
       <Text style={styles.title}>{year} 年 {month + 1} 月</Text>
-      <Text style={styles.date}>每格 = 摄入 − 基础代谢 − 运动</Text>
+      <Text style={styles.date}>点击日期可查看或补填 · 每格 = 摄入 − 代谢 − 运动</Text>
 
       <View style={styles.calWeek}>
         {WEEKDAYS.map(w => <Text key={w} style={styles.calWeekText}>{w}</Text>)}
@@ -476,12 +549,15 @@ function CalendarPage({ allMonthData, bmr, goalKg, saveGoal, goalCal, net }) {
           const key = `${year}-${String(month + 1).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
           const val = allMonthData[key];
           const isToday = d === today.getDate();
+          const future = key > todayStr;
           const color = val == null ? "#555" : val <= 0 ? "#6ee7b7" : "#f87171";
           return (
-            <View key={i} style={[styles.calCell, isToday && styles.calCellToday]}>
-              <Text style={[styles.calDay, { color: isToday ? "#6ee7b7" : "#bbb" }]}>{d}</Text>
+            <TouchableOpacity key={i} style={[styles.calCell, isToday && styles.calCellToday]}
+              disabled={future} activeOpacity={0.6}
+              onPress={() => onPickDay(key)}>
+              <Text style={[styles.calDay, { color: future ? "#333" : isToday ? "#6ee7b7" : "#bbb" }]}>{d}</Text>
               {val != null && <Text style={[styles.calVal, { color }]}>{val <= 0 ? "" : "+"}{val}</Text>}
-            </View>
+            </TouchableOpacity>
           );
         })}
       </View>
@@ -528,10 +604,74 @@ function Macro({ val, label, color, pct }) {
   );
 }
 
+const METRIC_OPTIONS = [
+  { key: "weight", label: "体重" },
+  { key: "waist", label: "腰围" },
+  { key: "lowerAbdomen", label: "下腹围" },
+  { key: "hip", label: "臀围" },
+  { key: "chest", label: "胸围" },
+  { key: "arm", label: "手臂围" },
+  { key: "thigh", label: "大腿围" },
+  { key: "calf", label: "小腿围" },
+];
+
+function BodyTrend({ bodyHistory, metric, setMetric }) {
+  // 取出有该指标数值的记录
+  const points = bodyHistory.filter(r => r[metric] != null);
+
+  return (
+    <View style={styles.trendCard}>
+      <Text style={styles.trendTitle}>身体趋势</Text>
+
+      {/* 指标切换 */}
+      <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.metricRow}>
+        {METRIC_OPTIONS.map(m => (
+          <TouchableOpacity key={m.key} onPress={() => setMetric(m.key)}
+            style={[styles.metricChip, metric === m.key && styles.metricChipActive]}>
+            <Text style={[styles.metricChipText, metric === m.key && styles.metricChipTextActive]}>{m.label}</Text>
+          </TouchableOpacity>
+        ))}
+      </ScrollView>
+
+      {points.length < 2 ? (
+        <View style={styles.trendEmpty}>
+          <Text style={styles.trendEmptyText}>
+            {points.length === 0 ? "还没有记录，填好数据后点「记录今日数据」" : "再记录一天就能看到趋势曲线了"}
+          </Text>
+        </View>
+      ) : (
+        <LineChart
+          data={{
+            labels: points.map(r => r.date.slice(5)), // MM-DD
+            datasets: [{ data: points.map(r => r[metric]) }],
+          }}
+          width={Dimensions.get("window").width - 64}
+          height={200}
+          chartConfig={{
+            backgroundGradientFrom: "#1a1a24",
+            backgroundGradientTo: "#1a1a24",
+            decimalPlaces: 1,
+            color: (o = 1) => `rgba(110, 231, 183, ${o})`,
+            labelColor: () => "#666",
+            propsForDots: { r: "4", strokeWidth: "2", stroke: "#6ee7b7" },
+          }}
+          bezier
+          style={{ marginTop: 12, borderRadius: 12 }}
+        />
+      )}
+    </View>
+  );
+}
+
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: "#16161e" },
   scroll: { padding: 16, paddingBottom: 30 },
   title: { color: "#e0e0e0", fontSize: 16, fontWeight: "600" },
+  recHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
+  todayBtn: { backgroundColor: "#1e1e28", borderRadius: 8, paddingHorizontal: 12, paddingVertical: 5 },
+  todayBtnText: { color: "#6ee7b7", fontSize: 11, fontWeight: "600" },
+  dateNav: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginTop: 4, marginBottom: 14 },
+  dateNavArrow: { color: "#6ee7b7", fontSize: 26, paddingHorizontal: 12, lineHeight: 28 },
   date: { color: "#555", fontSize: 12, marginTop: 2, marginBottom: 14 },
   tabs: { flexDirection: "row", backgroundColor: "#1e1e28", borderRadius: 14, padding: 4, gap: 2, marginBottom: 14 },
   tab: { flex: 1, alignItems: "center", paddingVertical: 8, borderRadius: 10 },
@@ -614,6 +754,17 @@ const styles = StyleSheet.create({
   profileLabel: { color: "#aaa", fontSize: 13, flex: 1 },
   profileInput: { color: "#6ee7b7", fontSize: 14, fontWeight: "600", textAlign: "right", minWidth: 60 },
   profileUnit: { color: "#555", fontSize: 11, marginLeft: 6, width: 30 },
+  recordBodyBtn: { marginTop: 12, backgroundColor: "#2d5a3d", borderRadius: 12, padding: 14, alignItems: "center" },
+  recordBodyBtnText: { color: "#6ee7b7", fontSize: 14, fontWeight: "700" },
+  trendCard: { marginTop: 16, backgroundColor: "#1a1a24", borderRadius: 14, padding: 14 },
+  trendTitle: { color: "#e0e0e0", fontSize: 14, fontWeight: "600", marginBottom: 10 },
+  metricRow: { flexDirection: "row" },
+  metricChip: { backgroundColor: "#252530", borderRadius: 8, paddingHorizontal: 12, paddingVertical: 6, marginRight: 6 },
+  metricChipActive: { backgroundColor: "#2d5a3d" },
+  metricChipText: { color: "#888", fontSize: 12 },
+  metricChipTextActive: { color: "#6ee7b7", fontWeight: "600" },
+  trendEmpty: { paddingVertical: 30, alignItems: "center" },
+  trendEmptyText: { color: "#555", fontSize: 12, textAlign: "center" },
   nav: { flexDirection: "row", backgroundColor: "#1a1a22", borderTopWidth: 1, borderTopColor: "#1e1e26", paddingTop: 8, paddingBottom: 8 },
   navItem: { flex: 1, alignItems: "center" },
   navIcon: { fontSize: 20, marginBottom: 2 },
