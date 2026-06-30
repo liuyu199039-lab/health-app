@@ -1,7 +1,8 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import {
   View, Text, Image, TouchableOpacity, ScrollView, TextInput,
-  ActivityIndicator, StyleSheet, StatusBar, SafeAreaView, Alert
+  ActivityIndicator, StyleSheet, StatusBar, SafeAreaView, Alert,
+  Animated, Modal
 } from "react-native";
 import * as ImagePicker from "expo-image-picker";
 import * as ImageManipulator from "expo-image-manipulator";
@@ -10,6 +11,9 @@ import * as SQLite from "expo-sqlite";
 import Svg, { Circle } from "react-native-svg";
 import { LineChart } from "react-native-chart-kit";
 import { Dimensions } from "react-native";
+// 卡片图片高度：全屏宽 - scroll padding(32) - card padding(28)，按 3:4 竖拍比例
+const RECIPE_IMG_W = Dimensions.get("window").width - 60;
+const RECIPE_IMG_H = Math.round(RECIPE_IMG_W * 4 / 3);
 
 // ⚠️ 把你的 API Key 填在下面引号里
 const API_KEY = "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";
@@ -104,6 +108,11 @@ function initDB() {
     CREATE TABLE IF NOT EXISTS snacks (
       date TEXT PRIMARY KEY, cal INTEGER
     );
+    CREATE TABLE IF NOT EXISTS recipes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT, cal INTEGER, p INTEGER, c INTEGER, f INTEGER,
+      photoUri TEXT, methodUri TEXT
+    );
   `);
 }
 
@@ -141,6 +150,9 @@ export default function App() {
   const [snackCal, setSnackCal] = useState("");
   const [themeKey, setThemeKey] = useState("dark");
   const [showSettings, setShowSettings] = useState(false);
+  const [showRecipeBook, setShowRecipeBook] = useState(false);
+  const [recipes, setRecipes] = useState([]);
+  const [mealPickModal, setMealPickModal] = useState(null); // recipe obj waiting for meal slot pick
   const t = THEMES[themeKey] || THEMES.dark;
   const styles = makeStyles(t);
 
@@ -159,6 +171,7 @@ export default function App() {
     loadBodyHistory();
     loadFavExercises();
     loadTheme();
+    loadRecipes();
     setReady(true);
   }, []);
 
@@ -180,6 +193,43 @@ export default function App() {
     // 读加餐
     const snackRows = db.getAllSync("SELECT cal FROM snacks WHERE date = ?", [dStr]);
     setSnackCal(snackRows.length && snackRows[0].cal ? String(snackRows[0].cal) : "");
+  }
+
+  function loadRecipes() {
+    setRecipes(db.getAllSync("SELECT * FROM recipes ORDER BY id DESC"));
+  }
+  async function saveRecipe(name, cal, p, c, f, photoUri, methodUri) {
+    const dir = FileSystem.documentDirectory + "recipes/";
+    await FileSystem.makeDirectoryAsync(dir, { intermediates: true }).catch(() => {});
+    const id = Date.now();
+    let permPhoto = photoUri;
+    let permMethod = methodUri;
+    try {
+      permPhoto = dir + `recipe_${id}_photo.jpg`;
+      await FileSystem.copyAsync({ from: photoUri, to: permPhoto });
+    } catch { permPhoto = photoUri; }
+    try {
+      permMethod = dir + `recipe_${id}_method.jpg`;
+      await FileSystem.copyAsync({ from: methodUri, to: permMethod });
+    } catch { permMethod = methodUri; }
+    db.runSync(
+      "INSERT INTO recipes (name, cal, p, c, f, photoUri, methodUri) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      [name, parseInt(cal) || 0, parseInt(p) || 0, parseInt(c) || 0, parseInt(f) || 0, permPhoto, permMethod]
+    );
+    loadRecipes();
+  }
+  function deleteRecipe(id) {
+    db.runSync("DELETE FROM recipes WHERE id = ?", [id]);
+    loadRecipes();
+  }
+  function addRecipeToMeal(recipe, slot) {
+    db.runSync(
+      "INSERT OR REPLACE INTO meals (date, slot, summary, cal, p, c, f, uri) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      [selDateStr, slot, recipe.name, recipe.cal, recipe.p, recipe.c, recipe.f, recipe.photoUri]
+    );
+    const newMeals = [...meals];
+    newMeals[slot] = { summary: recipe.name, cal: recipe.cal, p: recipe.p, c: recipe.c, f: recipe.f, uri: recipe.photoUri };
+    setMeals(newMeals);
   }
 
   function loadFavExercises() {
@@ -260,11 +310,15 @@ export default function App() {
     const prefix = `${year}-${String(month + 1).padStart(2, "0")}`;
     const mealRows = db.getAllSync("SELECT date, SUM(cal) as total FROM meals WHERE date LIKE ? GROUP BY date", [prefix + "%"]);
     const exRows = db.getAllSync("SELECT date, SUM(cal) as total FROM exercises WHERE date LIKE ? GROUP BY date", [prefix + "%"]);
+    const snackRows = db.getAllSync("SELECT date, cal FROM snacks WHERE date LIKE ?", [prefix + "%"]);
     const intake = {}; mealRows.forEach(r => { intake[r.date] = r.total; });
     const exer = {}; exRows.forEach(r => { exer[r.date] = r.total; });
+    const snack = {}; snackRows.forEach(r => { snack[r.date] = r.cal || 0; });
+    const allDates = new Set([...Object.keys(intake), ...Object.keys(snack)]);
     const out = {};
-    Object.keys(intake).forEach(d => {
-      if (bmr && intake[d]) out[d] = intake[d] - bmr - (exer[d] || 0);
+    allDates.forEach(d => {
+      const totalIn = (intake[d] || 0) + (snack[d] || 0);
+      if (bmr && totalIn) out[d] = totalIn - bmr - (exer[d] || 0);
     });
     setAllMonthData(out);
   }
@@ -414,14 +468,19 @@ export default function App() {
       <ScrollView contentContainerStyle={styles.scroll}>
 
         {/* ════════ 记录 ════════ */}
-        {tab === 0 && (<>
+        {tab === 0 && !showRecipeBook && (<>
           <View style={styles.recHeader}>
             <Text style={styles.title}>{isToday ? "今日记录" : "历史记录"}</Text>
-            {!isToday && (
-              <TouchableOpacity onPress={() => setSelDateStr(todayStr)} style={styles.todayBtn}>
-                <Text style={styles.todayBtnText}>回到今天</Text>
+            <View style={{ flexDirection: "row", gap: 8 }}>
+              <TouchableOpacity onPress={() => setShowRecipeBook(true)} style={styles.todayBtn}>
+                <Text style={styles.todayBtnText}>📖 菜谱册</Text>
               </TouchableOpacity>
-            )}
+              {!isToday && (
+                <TouchableOpacity onPress={() => setSelDateStr(todayStr)} style={styles.todayBtn}>
+                  <Text style={styles.todayBtnText}>回到今天</Text>
+                </TouchableOpacity>
+              )}
+            </View>
           </View>
           <View style={styles.dateNav}>
             <TouchableOpacity onPress={() => {
@@ -533,6 +592,20 @@ export default function App() {
             )}
           </View>
         </>)}
+
+        {/* ════════ 菜谱册 ════════ */}
+        {tab === 0 && showRecipeBook && (
+          <RecipeBook
+            styles={styles} t={t}
+            recipes={recipes}
+            onBack={() => setShowRecipeBook(false)}
+            onSave={saveRecipe}
+            onDelete={deleteRecipe}
+            onAddToMeal={(recipe) => {
+              setMealPickModal(recipe);
+            }}
+          />
+        )}
 
         {/* ════════ 运动 ════════ */}
         {tab === 1 && !showExLib && (<>
@@ -666,12 +739,37 @@ export default function App() {
 
       <View style={styles.nav}>
         {NAV.map((n, i) => (
-          <TouchableOpacity key={i} style={styles.navItem} onPress={() => i === 2 ? goToCalendar() : setTab(i)}>
+          <TouchableOpacity key={i} style={styles.navItem} onPress={() => { setShowRecipeBook(false); i === 2 ? goToCalendar() : setTab(i); }}>
             <Text style={styles.navIcon}>{n.icon}</Text>
             <Text style={[styles.navLabel, { color: tab === i ? "#6ee7b7" : t.textFaint }]}>{n.label}</Text>
           </TouchableOpacity>
         ))}
       </View>
+
+      {/* ── 选餐次弹窗 ── */}
+      <Modal transparent animationType="fade" visible={!!mealPickModal} onRequestClose={() => setMealPickModal(null)}>
+        <TouchableOpacity style={styles.modalOverlay} activeOpacity={1} onPress={() => setMealPickModal(null)}>
+          <View style={[styles.mealPickSheet, { backgroundColor: t.surface }]}>
+            <Text style={[styles.mealPickTitle, { color: t.text }]}>添加到哪一餐？</Text>
+            {MEAL_LABELS.map((m, i) => (
+              <TouchableOpacity key={i} style={[styles.mealPickRow, { borderTopColor: t.border }]}
+                onPress={() => {
+                  if (mealPickModal) addRecipeToMeal(mealPickModal, i);
+                  setMealPickModal(null);
+                  setShowRecipeBook(false);
+                  setTab(0);
+                  Alert.alert("已添加", `${mealPickModal?.name} 已加到${m.label}`);
+                }}>
+                <Text style={{ fontSize: 20 }}>{m.emoji}</Text>
+                <Text style={[styles.mealPickLabel, { color: t.text }]}>{m.label}</Text>
+              </TouchableOpacity>
+            ))}
+            <TouchableOpacity style={styles.mealPickCancel} onPress={() => setMealPickModal(null)}>
+              <Text style={{ color: t.textDim, fontSize: 14 }}>取消</Text>
+            </TouchableOpacity>
+          </View>
+        </TouchableOpacity>
+      </Modal>
     </SafeAreaView>
   );
 }
@@ -845,6 +943,178 @@ function ExerciseLibrary({ styles, favExercises, addFav, removeFav, onBack }) {
       ))}
       {favExercises.length === 0 && <Text style={styles.libEmpty}>还没有登记任何常用运动</Text>}
     </>
+  );
+}
+
+function RecipeBook({ styles, t, recipes, onBack, onSave, onDelete, onAddToMeal }) {
+  const [showForm, setShowForm] = useState(false);
+  const [name, setName] = useState("");
+  const [cal, setCal] = useState("");
+  const [p, setP] = useState("");
+  const [c, setC] = useState("");
+  const [f, setF] = useState("");
+  const [photoUri, setPhotoUri] = useState(null);
+  const [methodUri, setMethodUri] = useState(null);
+  const [saving, setSaving] = useState(false);
+
+  async function pickPhoto(setter) {
+    const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (!perm.granted) { Alert.alert("需要相册权限"); return; }
+    const result = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ImagePicker.MediaTypeOptions.Images, quality: 0.8 });
+    if (!result.canceled) setter(result.assets[0].uri);
+  }
+
+  async function submit() {
+    if (!name.trim() || !cal || !photoUri || !methodUri) {
+      Alert.alert("请填写", "菜名、卡路里、两张图片都必须填写"); return;
+    }
+    setSaving(true);
+    await onSave(name.trim(), cal, p, c, f, photoUri, methodUri);
+    setName(""); setCal(""); setP(""); setC(""); setF(""); setPhotoUri(null); setMethodUri(null);
+    setSaving(false);
+    setShowForm(false);
+  }
+
+  return (
+    <>
+      <View style={styles.recHeader}>
+        <Text style={styles.title}>菜谱册</Text>
+        <TouchableOpacity onPress={onBack} style={styles.todayBtn}>
+          <Text style={styles.todayBtnText}>‹ 返回</Text>
+        </TouchableOpacity>
+      </View>
+      <Text style={styles.date}>登记常做的菜，可直接添加到餐食</Text>
+
+      {/* 展开/收起新增表单 */}
+      <TouchableOpacity style={styles.recipeAddToggle} onPress={() => setShowForm(v => !v)}>
+        <Text style={styles.recipeAddToggleText}>{showForm ? "▲ 收起" : "+ 新增菜谱"}</Text>
+      </TouchableOpacity>
+
+      {showForm && (
+        <View style={[styles.libAddCard, { marginBottom: 16 }]}>
+          <TextInput value={name} onChangeText={setName} placeholder="菜名" placeholderTextColor="#999"
+            style={styles.libNameInput} />
+          <View style={{ flexDirection: "row", gap: 8, marginBottom: 10 }}>
+            <View style={{ flex: 1 }}>
+              <Text style={[styles.cardLabel, { marginBottom: 4 }]}>卡路里 kcal</Text>
+              <TextInput value={cal} onChangeText={setCal} placeholder="0" placeholderTextColor="#999"
+                keyboardType="number-pad" style={[styles.libCalInput, { minWidth: 0, width: "100%" }]} />
+            </View>
+            <View style={{ flex: 1 }}>
+              <Text style={[styles.cardLabel, { marginBottom: 4 }]}>蛋白质 g</Text>
+              <TextInput value={p} onChangeText={setP} placeholder="0" placeholderTextColor="#999"
+                keyboardType="number-pad" style={[styles.libCalInput, { minWidth: 0, width: "100%", color: "#60a5fa" }]} />
+            </View>
+          </View>
+          <View style={{ flexDirection: "row", gap: 8, marginBottom: 12 }}>
+            <View style={{ flex: 1 }}>
+              <Text style={[styles.cardLabel, { marginBottom: 4 }]}>碳水 g</Text>
+              <TextInput value={c} onChangeText={setC} placeholder="0" placeholderTextColor="#999"
+                keyboardType="number-pad" style={[styles.libCalInput, { minWidth: 0, width: "100%", color: "#f59e0b" }]} />
+            </View>
+            <View style={{ flex: 1 }}>
+              <Text style={[styles.cardLabel, { marginBottom: 4 }]}>脂肪 g</Text>
+              <TextInput value={f} onChangeText={setF} placeholder="0" placeholderTextColor="#999"
+                keyboardType="number-pad" style={[styles.libCalInput, { minWidth: 0, width: "100%", color: "#f87171" }]} />
+            </View>
+          </View>
+          {/* 图片选择 */}
+          <View style={{ flexDirection: "row", gap: 10, marginBottom: 12 }}>
+            <TouchableOpacity style={styles.recipeImgPicker} onPress={() => pickPhoto(setPhotoUri)}>
+              {photoUri
+                ? <Image source={{ uri: photoUri }} style={styles.recipeImgThumb} />
+                : <Text style={{ color: "#999", fontSize: 11, textAlign: "center" }}>📷{"\n"}成品图</Text>}
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.recipeImgPicker} onPress={() => pickPhoto(setMethodUri)}>
+              {methodUri
+                ? <Image source={{ uri: methodUri }} style={styles.recipeImgThumb} />
+                : <Text style={{ color: "#999", fontSize: 11, textAlign: "center" }}>📋{"\n"}做法图</Text>}
+            </TouchableOpacity>
+          </View>
+          <TouchableOpacity style={styles.libAddBtn} onPress={submit} disabled={saving}>
+            <Text style={styles.libAddBtnText}>{saving ? "保存中…" : "登记菜谱"}</Text>
+          </TouchableOpacity>
+        </View>
+      )}
+
+      {recipes.length === 0 && <Text style={styles.libEmpty}>还没有菜谱，快去登记第一道吧！</Text>}
+      {recipes.map(r => (
+        <RecipeCard key={r.id} recipe={r} styles={styles} t={t} onDelete={onDelete} onAddToMeal={onAddToMeal} />
+      ))}
+    </>
+  );
+}
+
+function RecipeCard({ recipe, styles, t, onDelete, onAddToMeal }) {
+  const flip = useRef(new Animated.Value(0)).current;
+  const [flipped, setFlipped] = useState(false);
+
+  function toggleFlip() {
+    Animated.spring(flip, {
+      toValue: flipped ? 0 : 1,
+      useNativeDriver: true,
+      friction: 8,
+    }).start();
+    setFlipped(!flipped);
+  }
+
+  const frontRotate = flip.interpolate({ inputRange: [0, 1], outputRange: ["0deg", "180deg"] });
+  const backRotate = flip.interpolate({ inputRange: [0, 1], outputRange: ["180deg", "360deg"] });
+
+  return (
+    <View style={styles.recipeCard}>
+      {/* 全宽翻转图片区 */}
+      <View style={styles.recipeCardImgWrap}>
+        <Animated.View style={[styles.recipeCardImgFace, { transform: [{ rotateY: frontRotate }] }]}>
+          <TouchableOpacity onPress={toggleFlip} activeOpacity={0.9} style={{ width: "100%" }}>
+            {recipe.photoUri
+              ? <Image source={{ uri: recipe.photoUri }} style={styles.recipeCardImg} />
+              : <View style={[styles.recipeCardImg, { backgroundColor: t.surface3, alignItems: "center", justifyContent: "center" }]}>
+                  <Text style={{ color: t.textMute }}>无图</Text>
+                </View>}
+            <View style={styles.recipeCardFlipHint}>
+              <Text style={{ color: "#fff", fontSize: 12 }}>成品图 · 点击查看做法</Text>
+            </View>
+          </TouchableOpacity>
+        </Animated.View>
+        <Animated.View style={[styles.recipeCardImgFace, styles.recipeCardImgBack, { transform: [{ rotateY: backRotate }] }]}>
+          <TouchableOpacity onPress={toggleFlip} activeOpacity={0.9} style={{ width: "100%" }}>
+            {recipe.methodUri
+              ? <Image source={{ uri: recipe.methodUri }} style={styles.recipeCardImg} />
+              : <View style={[styles.recipeCardImg, { backgroundColor: t.surface3, alignItems: "center", justifyContent: "center" }]}>
+                  <Text style={{ color: t.textMute }}>无图</Text>
+                </View>}
+            <View style={styles.recipeCardFlipHint}>
+              <Text style={{ color: "#fff", fontSize: 12 }}>做法图 · 点击返回</Text>
+            </View>
+          </TouchableOpacity>
+        </Animated.View>
+      </View>
+
+      {/* 文字信息行 */}
+      <View style={{ flexDirection: "row", alignItems: "center", marginTop: 12 }}>
+        <View style={{ flex: 1 }}>
+          <Text style={[styles.title, { fontSize: 15, marginBottom: 4 }]}>{recipe.name}</Text>
+          <View style={{ flexDirection: "row", gap: 10, flexWrap: "wrap" }}>
+            <Text style={{ color: "#6ee7b7", fontSize: 13, fontWeight: "700" }}>{recipe.cal} kcal</Text>
+            <Text style={{ color: "#60a5fa", fontSize: 12 }}>蛋白 {recipe.p}g</Text>
+            <Text style={{ color: "#f59e0b", fontSize: 12 }}>碳水 {recipe.c}g</Text>
+            <Text style={{ color: "#f87171", fontSize: 12 }}>脂肪 {recipe.f}g</Text>
+          </View>
+        </View>
+        <TouchableOpacity style={styles.recipeAddBtn} onPress={() => onAddToMeal(recipe)}>
+          <Text style={styles.recipeAddBtnText}>+ 添加到餐</Text>
+        </TouchableOpacity>
+      </View>
+
+      <TouchableOpacity style={styles.recipeDeleteBtn} onPress={() =>
+        Alert.alert("删除菜谱", `确定删除「${recipe.name}」？`, [
+          { text: "取消" },
+          { text: "删除", style: "destructive", onPress: () => onDelete(recipe.id) },
+        ])}>
+        <Text style={{ color: "#f87171", fontSize: 11 }}>🗑 删除</Text>
+      </TouchableOpacity>
+    </View>
   );
 }
 
@@ -1050,4 +1320,25 @@ const makeStyles = (t) => StyleSheet.create({
   navItem: { flex: 1, alignItems: "center" },
   navIcon: { fontSize: 20, marginBottom: 2 },
   navLabel: { fontSize: 10 },
+  // recipe book
+  recipeImgPicker: { width: 120, height: 90, borderRadius: 10, borderWidth: 1.5, borderColor: t.textFaint, borderStyle: "dashed", alignItems: "center", justifyContent: "center", overflow: "hidden" },
+  recipeImgThumb: { width: "100%", height: "100%", resizeMode: "cover" },
+  recipeCard: { backgroundColor: t.surface, borderRadius: 14, padding: 14, marginBottom: 14 },
+  recipeCardImgWrap: { width: "100%", height: RECIPE_IMG_H, position: "relative" },
+  recipeCardImgFace: { position: "absolute", width: "100%", height: "100%", backfaceVisibility: "hidden" },
+  recipeCardImgBack: { backfaceVisibility: "hidden" },
+  recipeCardImg: { width: "100%", height: RECIPE_IMG_H, borderRadius: 10, resizeMode: "cover" },
+  recipeCardFlipHint: { position: "absolute", bottom: 0, left: 0, right: 0, backgroundColor: "rgba(0,0,0,0.45)", borderBottomLeftRadius: 10, borderBottomRightRadius: 10, paddingVertical: 6, alignItems: "center" },
+  recipeAddToggle: { backgroundColor: "#2d5a3d", borderRadius: 10, paddingHorizontal: 16, paddingVertical: 10, alignSelf: "flex-start", marginBottom: 12 },
+  recipeAddToggleText: { color: "#6ee7b7", fontSize: 13, fontWeight: "700" },
+  recipeAddBtn: { backgroundColor: "#2d5a3d", borderRadius: 8, paddingHorizontal: 12, paddingVertical: 8 },
+  recipeAddBtnText: { color: "#6ee7b7", fontSize: 12, fontWeight: "600" },
+  recipeDeleteBtn: { marginTop: 10, alignItems: "flex-end" },
+  // meal pick modal
+  modalOverlay: { flex: 1, backgroundColor: "rgba(0,0,0,0.5)", justifyContent: "flex-end" },
+  mealPickSheet: { borderTopLeftRadius: 20, borderTopRightRadius: 20, padding: 20, paddingBottom: 32 },
+  mealPickTitle: { fontSize: 15, fontWeight: "700", textAlign: "center", marginBottom: 16 },
+  mealPickRow: { flexDirection: "row", alignItems: "center", gap: 14, paddingVertical: 14, borderTopWidth: 1 },
+  mealPickLabel: { fontSize: 15 },
+  mealPickCancel: { marginTop: 14, alignItems: "center", paddingVertical: 12, backgroundColor: t.surface3, borderRadius: 12 },
 });
