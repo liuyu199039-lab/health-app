@@ -12,8 +12,10 @@ import { LineChart } from "react-native-chart-kit";
 import { Dimensions, Platform } from "react-native";
 import { supabase } from "./supabase";
 import { decode as decodeBase64 } from "base64-arraybuffer";
-// 卡片图片高度：全屏宽 - scroll padding(32) - card padding(28)，按 3:4 竖拍比例
-const RECIPE_IMG_W = Dimensions.get("window").width - 60;
+// 卡片图片高度：内容宽度 - 边距，按 3:4 竖拍比例。
+// 网页版内容被限制在 480px 内，所以图片宽度也封顶，避免宽屏下巨大。
+const CONTENT_W = Math.min(Dimensions.get("window").width, 480);
+const RECIPE_IMG_W = CONTENT_W - 60;
 const RECIPE_IMG_H = Math.round(RECIPE_IMG_W * 4 / 3);
 
 // ⚠️ 把你的 API Key 填在下面引号里
@@ -1235,7 +1237,18 @@ function BodyTrend({ styles, t, bodyHistory, metric, setMetric }) {
 }
 
 const makeStyles = (t) => StyleSheet.create({
-  safe: { flex: 1, backgroundColor: t.bg },
+  safe: {
+    flex: 1,
+    backgroundColor: t.bg,
+    // 网页版：限制成手机宽度并居中，避免宽屏拉伸变形
+    ...(Platform.OS === "web" ? {
+      maxWidth: 480,
+      width: "100%",
+      marginLeft: "auto",
+      marginRight: "auto",  // 左右 auto 外边距 = 水平居中
+      boxShadow: "0 0 40px rgba(0,0,0,0.15)",  // 两侧加点阴影，像一台手机
+    } : {}),
+  },
   scroll: { padding: 16, paddingBottom: 30 },
   title: { color: t.text, fontSize: 16, fontWeight: "600" },
   recHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
