@@ -6,11 +6,12 @@ import {
 } from "react-native";
 import * as ImagePicker from "expo-image-picker";
 import * as ImageManipulator from "expo-image-manipulator";
-import * as FileSystem from "expo-file-system";
-import * as SQLite from "expo-sqlite";
+import * as FileSystem from "expo-file-system/legacy";
 import Svg, { Circle } from "react-native-svg";
 import { LineChart } from "react-native-chart-kit";
-import { Dimensions } from "react-native";
+import { Dimensions, Platform } from "react-native";
+import { supabase } from "./supabase";
+import { decode as decodeBase64 } from "base64-arraybuffer";
 // 卡片图片高度：全屏宽 - scroll padding(32) - card padding(28)，按 3:4 竖拍比例
 const RECIPE_IMG_W = Dimensions.get("window").width - 60;
 const RECIPE_IMG_H = Math.round(RECIPE_IMG_W * 4 / 3);
@@ -39,6 +40,37 @@ const BODY_FIELDS = [
 
 function dateKey(d) {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+// 把本地图片上传到 Supabase Storage 的 images 桶，返回可公开访问的网址。
+// path 例如 "meals/2026-08-15_0.jpg" 或 "recipes/1_photo.jpg"
+async function uploadImage(localUri, path) {
+  // 读取图片二进制数据：手机和网页方式不同
+  let fileData;
+  if (Platform.OS === "web") {
+    // 网页：图片是 blob: 地址，用 fetch 读成 blob 直接上传
+    fileData = await (await fetch(localUri)).blob();
+  } else {
+    // 手机：读成 base64 再解码成二进制
+    const base64 = await FileSystem.readAsStringAsync(localUri, { encoding: FileSystem.EncodingType.Base64 });
+    fileData = decodeBase64(base64);
+  }
+  // 上传到 images 桶，upsert:true 表示同名覆盖
+  const { error } = await supabase.storage.from("images").upload(path, fileData, {
+    contentType: "image/jpeg",
+    upsert: true,
+  });
+  if (error) throw error;
+  // 取这张图的公开网址，存进数据库表
+  const { data } = supabase.storage.from("images").getPublicUrl(path);
+  return data.publicUrl;
+}
+
+// 从公开网址反推出 Storage 里的路径（删除图片时用）
+function storagePathFromUrl(url) {
+  if (!url) return null;
+  const m = url.match(/\/images\/(.+)$/);
+  return m ? m[1] : null;
 }
 
 // ── 主题配色 ──
@@ -78,44 +110,6 @@ const THEMES = {
 };
 const THEME_KEYS = ["dark", "light", "pink", "blue"];
 
-// 打开数据库
-const db = SQLite.openDatabaseSync("health.db");
-
-// 初始化表
-function initDB() {
-  db.execSync(`
-    CREATE TABLE IF NOT EXISTS meals (
-      date TEXT, slot INTEGER, summary TEXT, cal INTEGER, p INTEGER, c INTEGER, f INTEGER, uri TEXT,
-      PRIMARY KEY (date, slot)
-    );
-    CREATE TABLE IF NOT EXISTS exercises (
-      id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT, name TEXT, duration INTEGER, cal INTEGER
-    );
-    CREATE TABLE IF NOT EXISTS profile (
-      key TEXT PRIMARY KEY, value TEXT
-    );
-    CREATE TABLE IF NOT EXISTS settings (
-      key TEXT PRIMARY KEY, value TEXT
-    );
-    CREATE TABLE IF NOT EXISTS body_history (
-      date TEXT PRIMARY KEY,
-      height REAL, weight REAL, bmr REAL, chest REAL, waist REAL,
-      lowerAbdomen REAL, hip REAL, arm REAL, thigh REAL, calf REAL
-    );
-    CREATE TABLE IF NOT EXISTS fav_exercises (
-      id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, cal INTEGER
-    );
-    CREATE TABLE IF NOT EXISTS snacks (
-      date TEXT PRIMARY KEY, cal INTEGER
-    );
-    CREATE TABLE IF NOT EXISTS recipes (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT, cal INTEGER, p INTEGER, c INTEGER, f INTEGER,
-      photoUri TEXT, methodUri TEXT
-    );
-  `);
-}
-
 async function callClaude(messages, maxTokens = 1000) {
   const resp = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
@@ -123,6 +117,7 @@ async function callClaude(messages, maxTokens = 1000) {
       "Content-Type": "application/json",
       "x-api-key": API_KEY,
       "anthropic-version": "2023-06-01",
+      "anthropic-dangerous-direct-browser-access": "true",  // 允许浏览器直连（网页版需要）
     },
     body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: maxTokens, messages }),
   });
@@ -163,9 +158,8 @@ export default function App() {
   const isToday = selDateStr === todayStr;
   const dateDisplay = `${selParts[0]} 年 ${selParts[1]} 月 ${selParts[2]} 日 · 周${WEEKDAYS[selDateObj.getDay()]}`;
 
-  // ── 启动：初始化数据库 ──
+  // ── 启动：从云端加载数据 ──
   useEffect(() => {
-    initDB();
     loadProfile();
     loadGoal();
     loadBodyHistory();
@@ -178,79 +172,112 @@ export default function App() {
   // 每当选中日期变化，重新读取那天的饮食和运动
   useEffect(() => {
     if (!ready) return;
-    loadDay(selDateStr);
+    loadMeals(selDateStr);
+    loadSnack(selDateStr);
+    loadExercises(selDateStr);
   }, [selDateStr, ready]);
 
-  function loadDay(dStr) {
-    // 读餐食
-    const mealRows = db.getAllSync("SELECT * FROM meals WHERE date = ?", [dStr]);
+  // 读某天的餐食（已迁移到 Supabase 云端）
+  async function loadMeals(dStr) {
+    const { data, error } = await supabase.from("meals").select("*").eq("date", dStr);
+    if (error) { console.log("读取餐食失败:", error.message); return; }
     const m = [null, null, null];
-    mealRows.forEach(r => { m[r.slot] = { summary: r.summary, cal: r.cal, p: r.p, c: r.c, f: r.f, uri: r.uri }; });
+    (data || []).forEach(r => { m[r.slot] = { summary: r.summary, cal: r.cal, p: r.p, c: r.c, f: r.f, uri: r.uri }; });
     setMeals(m);
-    // 读运动
-    const exRows = db.getAllSync("SELECT * FROM exercises WHERE date = ?", [dStr]);
-    setExercises(exRows.map(r => ({ id: r.id, name: r.name, duration: String(r.duration), cal: r.cal })));
-    // 读加餐
-    const snackRows = db.getAllSync("SELECT cal FROM snacks WHERE date = ?", [dStr]);
-    setSnackCal(snackRows.length && snackRows[0].cal ? String(snackRows[0].cal) : "");
   }
 
-  function loadRecipes() {
-    setRecipes(db.getAllSync("SELECT * FROM recipes ORDER BY id DESC"));
+  // 读某天的运动（已迁移到 Supabase 云端）
+  async function loadExercises(dStr) {
+    const { data, error } = await supabase
+      .from("exercises")
+      .select("*")
+      .eq("date", dStr)
+      .order("id", { ascending: true });
+    if (error) { console.log("读取运动失败:", error.message); return; }
+    setExercises((data || []).map(r => ({ id: r.id, name: r.name, duration: r.duration ? String(r.duration) : "", cal: r.cal })));
+  }
+
+  // 读加餐（已迁移到 Supabase 云端）
+  async function loadSnack(dStr) {
+    const { data, error } = await supabase
+      .from("snacks")
+      .select("cal")
+      .eq("date", dStr);
+    if (error) { console.log("读取加餐失败:", error.message); return; }
+    setSnackCal(data.length && data[0].cal ? String(data[0].cal) : "");
+  }
+
+  async function loadRecipes() {
+    const { data, error } = await supabase.from("recipes").select("*").order("id", { ascending: false });
+    if (error) { console.log("读取菜谱失败:", error.message); return; }
+    setRecipes(data || []);
   }
   async function saveRecipe(name, cal, p, c, f, photoUri, methodUri) {
-    const dir = FileSystem.documentDirectory + "recipes/";
-    await FileSystem.makeDirectoryAsync(dir, { intermediates: true }).catch(() => {});
-    const id = Date.now();
-    let permPhoto = photoUri;
-    let permMethod = methodUri;
-    try {
-      permPhoto = dir + `recipe_${id}_photo.jpg`;
-      await FileSystem.copyAsync({ from: photoUri, to: permPhoto });
-    } catch { permPhoto = photoUri; }
-    try {
-      permMethod = dir + `recipe_${id}_method.jpg`;
-      await FileSystem.copyAsync({ from: methodUri, to: permMethod });
-    } catch { permMethod = methodUri; }
-    db.runSync(
-      "INSERT INTO recipes (name, cal, p, c, f, photoUri, methodUri) VALUES (?, ?, ?, ?, ?, ?, ?)",
-      [name, parseInt(cal) || 0, parseInt(p) || 0, parseInt(c) || 0, parseInt(f) || 0, permPhoto, permMethod]
-    );
+    const id = Date.now();  // 仅用于给图片命名，避免重名
+    let photoUrl = null, methodUrl = null;
+    try { photoUrl = await uploadImage(photoUri, `recipes/${id}_photo.jpg`); }
+    catch (e) { console.log("菜谱成品图上传失败:", e.message); }
+    try { methodUrl = await uploadImage(methodUri, `recipes/${id}_method.jpg`); }
+    catch (e) { console.log("菜谱做法图上传失败:", e.message); }
+    const { error } = await supabase.from("recipes").insert({
+      name, cal: parseInt(cal) || 0, p: parseInt(p) || 0, c: parseInt(c) || 0, f: parseInt(f) || 0,
+      photoUri: photoUrl, methodUri: methodUrl,
+    });
+    if (error) { console.log("保存菜谱失败:", error.message); return; }
     loadRecipes();
   }
-  function deleteRecipe(id) {
-    db.runSync("DELETE FROM recipes WHERE id = ?", [id]);
+  async function deleteRecipe(id) {
+    // 先删云端图片文件，再删表记录
+    const r = recipes.find(x => x.id === id);
+    if (r) {
+      const paths = [storagePathFromUrl(r.photoUri), storagePathFromUrl(r.methodUri)].filter(Boolean);
+      if (paths.length) await supabase.storage.from("images").remove(paths);
+    }
+    const { error } = await supabase.from("recipes").delete().eq("id", id);
+    if (error) { console.log("删除菜谱失败:", error.message); return; }
     loadRecipes();
   }
-  function addRecipeToMeal(recipe, slot) {
-    db.runSync(
-      "INSERT OR REPLACE INTO meals (date, slot, summary, cal, p, c, f, uri) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-      [selDateStr, slot, recipe.name, recipe.cal, recipe.p, recipe.c, recipe.f, recipe.photoUri]
-    );
+  async function addRecipeToMeal(recipe, slot) {
+    const { error } = await supabase.from("meals").upsert({
+      date: selDateStr, slot,
+      summary: recipe.name, cal: recipe.cal, p: recipe.p, c: recipe.c, f: recipe.f, uri: recipe.photoUri,
+    });
+    if (error) { console.log("添加到餐失败:", error.message); return; }
     const newMeals = [...meals];
     newMeals[slot] = { summary: recipe.name, cal: recipe.cal, p: recipe.p, c: recipe.c, f: recipe.f, uri: recipe.photoUri };
     setMeals(newMeals);
   }
 
-  function loadFavExercises() {
-    setFavExercises(db.getAllSync("SELECT * FROM fav_exercises ORDER BY id DESC"));
+  async function loadFavExercises() {
+    const { data, error } = await supabase.from("fav_exercises").select("*").order("id", { ascending: false });
+    if (error) { console.log("读取常用运动失败:", error.message); return; }
+    setFavExercises(data || []);
   }
-  function addFavExercise(name, cal) {
-    db.runSync("INSERT INTO fav_exercises (name, cal) VALUES (?, ?)", [name, parseInt(cal) || 0]);
+  async function addFavExercise(name, cal) {
+    const { error } = await supabase.from("fav_exercises").insert({ name, cal: parseInt(cal) || 0 });
+    if (error) { console.log("添加常用运动失败:", error.message); return; }
     loadFavExercises();
   }
-  function removeFavExercise(id) {
-    db.runSync("DELETE FROM fav_exercises WHERE id = ?", [id]);
+  async function removeFavExercise(id) {
+    const { error } = await supabase.from("fav_exercises").delete().eq("id", id);
+    if (error) { console.log("删除常用运动失败:", error.message); return; }
     loadFavExercises();
   }
   // 从常用库添加一条到今天的运动
-  function addExerciseFromFav(fav) {
-    const res = db.runSync("INSERT INTO exercises (date, name, duration, cal) VALUES (?, ?, 0, ?)", [selDateStr, fav.name, fav.cal]);
-    setExercises(prev => [...prev, { id: res.lastInsertRowId, name: fav.name, duration: "", cal: fav.cal }]);
+  async function addExerciseFromFav(fav) {
+    const { data, error } = await supabase
+      .from("exercises")
+      .insert({ date: selDateStr, name: fav.name, duration: 0, cal: fav.cal })
+      .select();  // 插入后返回新行，拿到数据库生成的 id
+    if (error) { console.log("添加运动失败:", error.message); return; }
+    setExercises(prev => [...prev, { id: data[0].id, name: fav.name, duration: "", cal: fav.cal }]);
   }
-  function saveSnack(value) {
-    setSnackCal(value);
-    db.runSync("INSERT OR REPLACE INTO snacks (date, cal) VALUES (?, ?)", [selDateStr, parseInt(value) || 0]);
+  async function saveSnack(value) {
+    setSnackCal(value);  // 先更新界面，打字即时可见
+    const { error } = await supabase
+      .from("snacks")
+      .upsert({ date: selDateStr, cal: parseInt(value) || 0 });
+    if (error) console.log("保存加餐失败:", error.message);
   }
   // 手动修改餐食的某个数值
   function editMealField(slot, field, value) {
@@ -259,61 +286,82 @@ export default function App() {
       const m = [...prev];
       if (m[slot]) {
         m[slot] = { ...m[slot], [field]: num };
-        db.runSync(`UPDATE meals SET ${field} = ? WHERE date = ? AND slot = ?`, [num, selDateStr, slot]);
+        supabase.from("meals").update({ [field]: num }).eq("date", selDateStr).eq("slot", slot)
+          .then(({ error }) => { if (error) console.log("修改餐食失败:", error.message); });
       }
       return m;
     });
   }
 
-  function loadProfile() {
-    const rows = db.getAllSync("SELECT * FROM profile");
+  async function loadProfile() {
+    const { data, error } = await supabase.from("profile").select("key, value");
+    if (error) { console.log("读取 profile 失败:", error.message); return; }
     const p = {};
-    rows.forEach(r => { p[r.key] = r.value; });
+    (data || []).forEach(r => { p[r.key] = r.value; });
     setProfile(p);
   }
 
-  function loadBodyHistory() {
-    const rows = db.getAllSync("SELECT * FROM body_history ORDER BY date ASC");
-    setBodyHistory(rows);
+  async function loadBodyHistory() {
+    const { data, error } = await supabase.from("body_history").select("*").order("date", { ascending: true });
+    if (error) { console.log("读取 body_history 失败:", error.message); return; }
+    setBodyHistory(data || []);
   }
 
-  function saveBodyToday() {
+  async function saveBodyToday() {
     const f = k => { const v = parseFloat(profile[k]); return isNaN(v) ? null : v; };
-    db.runSync(
-      `INSERT OR REPLACE INTO body_history
-        (date, height, weight, bmr, chest, waist, lowerAbdomen, hip, arm, thigh, calf)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [todayStr, f("height"), f("weight"), f("bmr"), f("chest"), f("waist"),
-       f("lowerAbdomen"), f("hip"), f("arm"), f("thigh"), f("calf")]
-    );
+    const { error } = await supabase.from("body_history").upsert({
+      date: todayStr,
+      height: f("height"), weight: f("weight"), bmr: f("bmr"),
+      chest: f("chest"), waist: f("waist"), lowerAbdomen: f("lowerAbdomen"),
+      hip: f("hip"), arm: f("arm"), thigh: f("thigh"), calf: f("calf"),
+    });
+    if (error) { Alert.alert("保存失败", error.message); return; }
     loadBodyHistory();
     Alert.alert("已记录", `${todayStr} 的身体数据已保存`);
   }
 
-  function loadGoal() {
-    const rows = db.getAllSync("SELECT value FROM settings WHERE key = 'goalKg'");
-    if (rows.length) setGoalKg(rows[0].value);
+  async function loadGoal() {
+    const { data, error } = await supabase.from("settings").select("value").eq("key", "goalKg");
+    if (error) { console.log("读取 goalKg 失败:", error.message); return; }
+    if (data && data.length) setGoalKg(data[0].value);
   }
 
-  function loadTheme() {
-    const rows = db.getAllSync("SELECT value FROM settings WHERE key = 'theme'");
-    if (rows.length && THEMES[rows[0].value]) setThemeKey(rows[0].value);
+  async function loadTheme() {
+    const { data, error } = await supabase.from("settings").select("value").eq("key", "theme");
+    if (error) { console.log("读取 theme 失败:", error.message); return; }
+    if (data && data.length && THEMES[data[0].value]) setThemeKey(data[0].value);
   }
-  function saveTheme(key) {
+  async function saveTheme(key) {
     setThemeKey(key);
-    db.runSync("INSERT OR REPLACE INTO settings (key, value) VALUES ('theme', ?)", [key]);
+    const { error } = await supabase.from("settings").upsert({ key: "theme", value: key });
+    if (error) console.log("保存 theme 失败:", error.message);
   }
 
   // 计算某月每天净支出（日历用）
-  function loadMonthData(year, month) {
+  async function loadMonthData(year, month) {
     const bmr = parseInt(profile.bmr) || 0;
     const prefix = `${year}-${String(month + 1).padStart(2, "0")}`;
-    const mealRows = db.getAllSync("SELECT date, SUM(cal) as total FROM meals WHERE date LIKE ? GROUP BY date", [prefix + "%"]);
-    const exRows = db.getAllSync("SELECT date, SUM(cal) as total FROM exercises WHERE date LIKE ? GROUP BY date", [prefix + "%"]);
-    const snackRows = db.getAllSync("SELECT date, cal FROM snacks WHERE date LIKE ?", [prefix + "%"]);
-    const intake = {}; mealRows.forEach(r => { intake[r.date] = r.total; });
-    const exer = {}; exRows.forEach(r => { exer[r.date] = r.total; });
-    const snack = {}; snackRows.forEach(r => { snack[r.date] = r.cal || 0; });
+    // 餐食、运动、加餐都从 Supabase 云端读取整月数据
+    const { data: mealRows, error: mealErr } = await supabase
+      .from("meals")
+      .select("date, cal")
+      .like("date", prefix + "%");
+    if (mealErr) console.log("读取月度餐食失败:", mealErr.message);
+    const { data: exRows, error: exErr } = await supabase
+      .from("exercises")
+      .select("date, cal")
+      .like("date", prefix + "%");
+    if (exErr) console.log("读取月度运动失败:", exErr.message);
+    const { data: snackRows, error } = await supabase
+      .from("snacks")
+      .select("date, cal")
+      .like("date", prefix + "%");
+    if (error) console.log("读取月度加餐失败:", error.message);
+    // 云端不做 GROUP BY，取回整月每条后在 JS 里按日期累加
+    const intake = {}; (mealRows || []).forEach(r => { intake[r.date] = (intake[r.date] || 0) + (r.cal || 0); });
+    // 云端不做 GROUP BY，取回整月每条运动后在 JS 里按日期累加
+    const exer = {}; (exRows || []).forEach(r => { exer[r.date] = (exer[r.date] || 0) + (r.cal || 0); });
+    const snack = {}; (snackRows || []).forEach(r => { snack[r.date] = r.cal || 0; });
     const allDates = new Set([...Object.keys(intake), ...Object.keys(snack)]);
     const out = {};
     allDates.forEach(d => {
@@ -342,22 +390,20 @@ export default function App() {
         ]
       }]);
       const parsed = JSON.parse(text.replace(/```json|```/g, "").trim());
-      // 把图片复制到 App 永久目录，避免临时缓存被系统清理
-      let permUri = mp.uri;
+      // 上传图片到 Supabase Storage，拿到公开网址
+      let publicUrl = null;
       try {
-        const dir = FileSystem.documentDirectory + "meals/";
-        await FileSystem.makeDirectoryAsync(dir, { intermediates: true }).catch(() => {});
-        permUri = dir + `${selDateStr}_${currentMeal}.jpg`;
-        await FileSystem.copyAsync({ from: mp.uri, to: permUri });
-      } catch (copyErr) {
-        permUri = mp.uri; // 复制失败就退回临时路径
+        publicUrl = await uploadImage(mp.uri, `meals/${selDateStr}_${currentMeal}.jpg`);
+      } catch (upErr) {
+        console.log("餐食图片上传失败:", upErr.message);
       }
-      const meal = { ...parsed, uri: permUri };
-      // 存数据库
-      db.runSync(
-        "INSERT OR REPLACE INTO meals (date, slot, summary, cal, p, c, f, uri) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        [selDateStr, currentMeal, meal.summary, meal.cal, meal.p, meal.c, meal.f, meal.uri]
-      );
+      const meal = { ...parsed, uri: publicUrl };
+      // 存数据库（云端）
+      const { error } = await supabase.from("meals").upsert({
+        date: selDateStr, slot: currentMeal,
+        summary: meal.summary, cal: meal.cal, p: meal.p, c: meal.c, f: meal.f, uri: meal.uri,
+      });
+      if (error) throw error;
       const newMeals = [...meals];
       newMeals[currentMeal] = meal;
       setMeals(newMeals);
@@ -367,25 +413,34 @@ export default function App() {
     setAnalyzing(false);
   }
 
-  function deleteMeal() {
-    db.runSync("DELETE FROM meals WHERE date = ? AND slot = ?", [selDateStr, currentMeal]);
+  async function deleteMeal() {
+    // 删云端图片（仅当这张图是上传到 meals/ 的，菜谱带过来的图不删）
+    const cur = meals[currentMeal];
+    const path = storagePathFromUrl(cur?.uri);
+    if (path && path.startsWith("meals/")) await supabase.storage.from("images").remove([path]);
+    const { error } = await supabase.from("meals").delete().eq("date", selDateStr).eq("slot", currentMeal);
+    if (error) { console.log("删除餐食失败:", error.message); return; }
     const newMeals = [...meals];
     newMeals[currentMeal] = null;
     setMeals(newMeals);
   }
 
   // ── 运动 ──
-  function addExercise() {
-    const res = db.runSync("INSERT INTO exercises (date, name, duration, cal) VALUES (?, '', 0, NULL)", [selDateStr]);
-    setExercises(prev => [...prev, { id: res.lastInsertRowId, name: "", duration: "", cal: null }]);
+  async function addExercise() {
+    const { data, error } = await supabase
+      .from("exercises")
+      .insert({ date: selDateStr, name: "", duration: 0, cal: null })
+      .select();
+    if (error) { console.log("新增运动失败:", error.message); return; }
+    setExercises(prev => [...prev, { id: data[0].id, name: "", duration: "", cal: null }]);
   }
-  function updateExercise(id, field, value) {
+  async function updateExercise(id, field, value) {
     setExercises(prev => prev.map(e => e.id === id ? { ...e, [field]: value } : e));
-    if (field === "name") db.runSync("UPDATE exercises SET name = ? WHERE id = ?", [value, id]);
-    if (field === "duration") db.runSync("UPDATE exercises SET duration = ? WHERE id = ?", [parseInt(value) || 0, id]);
+    if (field === "name") await supabase.from("exercises").update({ name: value }).eq("id", id);
+    if (field === "duration") await supabase.from("exercises").update({ duration: parseInt(value) || 0 }).eq("id", id);
   }
-  function removeExercise(id) {
-    db.runSync("DELETE FROM exercises WHERE id = ?", [id]);
+  async function removeExercise(id) {
+    await supabase.from("exercises").delete().eq("id", id);
     setExercises(prev => prev.filter(e => e.id !== id));
   }
   async function calcExercise(id, name, duration) {
@@ -401,11 +456,11 @@ export default function App() {
       }], 100);
       const num = parseInt(text.replace(/[^\d]/g, ""));
       const cal = !isNaN(num) && num > 0 ? num : Math.round(parseInt(duration) * 5.5);
-      db.runSync("UPDATE exercises SET cal = ? WHERE id = ?", [cal, id]);
+      await supabase.from("exercises").update({ cal }).eq("id", id);
       setExercises(prev => prev.map(e => e.id === id ? { ...e, cal } : e));
     } catch {
       const cal = Math.round(parseInt(duration) * 5.5);
-      db.runSync("UPDATE exercises SET cal = ? WHERE id = ?", [cal, id]);
+      await supabase.from("exercises").update({ cal }).eq("id", id);
       setExercises(prev => prev.map(e => e.id === id ? { ...e, cal } : e));
     }
     setExLoading(prev => ({ ...prev, [id]: false }));
@@ -416,15 +471,17 @@ export default function App() {
   }
 
   // ── 个人资料 ──
-  function saveProfile(key, value) {
+  async function saveProfile(key, value) {
     setProfile(p => ({ ...p, [key]: value }));
-    db.runSync("INSERT OR REPLACE INTO profile (key, value) VALUES (?, ?)", [key, value]);
+    const { error } = await supabase.from("profile").upsert({ key, value });
+    if (error) console.log("保存 profile 失败:", error.message);
   }
 
   // ── 目标 ──
-  function saveGoal(value) {
+  async function saveGoal(value) {
     setGoalKg(value);
-    db.runSync("INSERT OR REPLACE INTO settings (key, value) VALUES ('goalKg', ?)", [value]);
+    const { error } = await supabase.from("settings").upsert({ key: "goalKg", value });
+    if (error) console.log("保存 goalKg 失败:", error.message);
   }
 
   // ── 计算 ──
