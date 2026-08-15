@@ -18,8 +18,8 @@ const CONTENT_W = Math.min(Dimensions.get("window").width, 480);
 const RECIPE_IMG_W = CONTENT_W - 60;
 const RECIPE_IMG_H = Math.round(RECIPE_IMG_W * 4 / 3);
 
-// ⚠️ 把你的 API Key 填在下面引号里
-const API_KEY = "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";
+// API Key 从环境变量读取（真实值在 .env.local，不进代码库）
+const API_KEY = process.env.EXPO_PUBLIC_ANTHROPIC_KEY;
 
 const MEAL_LABELS = [
   { label: "早餐", emoji: "🌅", color: "#6ee7b7" },

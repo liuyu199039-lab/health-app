@@ -1,9 +1,9 @@
 import { createClient } from "@supabase/supabase-js";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 
-// Supabase 项目连接配置
-const SUPABASE_URL = "https://ppagxkmciggmosxjbkgu.supabase.co";
-const SUPABASE_KEY = "sb_publishable_-qA71Mwvvw_ODjfjAMPhWQ_s9gk7l59";
+// Supabase 项目连接配置（从环境变量读取，真实值在 .env.local，不进代码库）
+const SUPABASE_URL = process.env.EXPO_PUBLIC_SUPABASE_URL;
+const SUPABASE_KEY = process.env.EXPO_PUBLIC_SUPABASE_KEY;
 
 // 创建一个可复用的 supabase 客户端，App 里各处都从这里 import
 export const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
